@@ -6,4 +6,5 @@ WORKDIR /agent
 COPY --chmod=0644 agent.py probes.py ./
 ENV PYTHONUNBUFFERED=1
 USER agent
-CMD ["python", "agent.py"]
+# docker run … IMAGE <домен панели> <токен nck_…>  — команду выдаёт панель
+ENTRYPOINT ["python", "agent.py"]

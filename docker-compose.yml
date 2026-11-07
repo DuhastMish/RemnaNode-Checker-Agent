@@ -1,0 +1,11 @@
+# Чекер через docker compose:  PANEL_URL=admin.example.com CHECKER_TOKEN=nck_… docker compose up -d
+# Домен и токен — из панели, раздел «Чекеры» → «Добавить».
+# restart: unless-stopped — чекер сам поднимается после перезагрузки машины и падений.
+services:
+  agent:
+    image: ghcr.io/duhastmish/remnanode-checker-agent:latest
+    container_name: nodecheck-agent
+    restart: unless-stopped
+    environment:
+      PANEL_URL: ${PANEL_URL:?set PANEL_URL}          # домен панели: admin.example.com
+      CHECKER_TOKEN: ${CHECKER_TOKEN:?set CHECKER_TOKEN}

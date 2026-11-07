@@ -1,8 +1,13 @@
 """Чекер nodecheck: забирает у панели список нод, проверяет их из своей сети, отправляет результаты.
 
-Окружение:
-  PANEL_URL      адрес панели (https://…; http разрешён только для localhost)
-  CHECKER_TOKEN  токен чекера из панели (раздел «Чекеры»)
+Запуск (команду с токеном выдаёт панель в разделе «Чекеры»):
+  docker run -d --name nodecheck-agent --restart unless-stopped IMAGE <домен панели> <токен nck_…>
+
+Домен без схемы означает https://домен; можно передать и полный адрес (https://admin.example.com:8443).
+Вместо аргументов — окружение (для docker compose):
+  PANEL_URL      домен или адрес панели (https://…; http разрешён только для localhost)
+  CHECKER_TOKEN  токен чекера (nck_…)
+  ALLOW_HTTP=1   разрешить http:// не только для localhost (токен пойдёт открытым текстом!)
 
 Работает только исходящими запросами (за NAT — нормально). Список нод и конфиг — только в памяти.
 Если панель недоступна — проверяет по кэшу, но результаты не буферизует (неотправленные теряются).
@@ -14,6 +19,7 @@ import logging
 import os
 import signal
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -24,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import probes
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 BATCH = 200
 
 log = logging.getLogger("agent")
@@ -262,15 +268,40 @@ class Agent:
             stop.wait(1)
 
 
+def panel_address(value):
+    """admin.example.com → https://admin.example.com; полный адрес — как есть."""
+    value = value.strip().rstrip("/")
+    return value if "://" in value else f"https://{value}" if value else ""
+
+
+def credentials(argv, env):
+    args = [a.strip() for a in argv[1:] if a.strip()]
+    if len(args) > 2:
+        raise SystemExit("лишние аргументы: нужно <домен панели> <токен>")
+    url = panel_address(args[0] if args else env.get("PANEL_URL", ""))
+    token = args[1] if len(args) > 1 else env.get("CHECKER_TOKEN", "").strip()
+    if not url or not token:
+        raise SystemExit(
+            "нужны домен панели и токен: docker run … IMAGE admin.example.com nck_… "
+            "(или переменные PANEL_URL и CHECKER_TOKEN)"
+        )
+    if not token.startswith("nck_"):
+        raise SystemExit("токен чекера должен начинаться с nck_ — скопируй команду из панели целиком")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise SystemExit(f"некорректный адрес панели: {url}")
+    insecure_ok = env.get("ALLOW_HTTP", "").strip().lower() in ("1", "true", "yes")
+    if parsed.scheme != "https" and parsed.hostname not in ("localhost", "127.0.0.1", "::1") and not insecure_ok:
+        raise SystemExit(
+            "адрес панели должен быть https:// (http разрешён только для localhost; "
+            "в доверенной локальной сети — с ALLOW_HTTP=1)"
+        )
+    return url, token
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    url = os.environ.get("PANEL_URL", "").strip()
-    token = os.environ.get("CHECKER_TOKEN", "").strip()
-    if not url or not token:
-        raise SystemExit("нужны переменные PANEL_URL и CHECKER_TOKEN")
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != "https" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
-        raise SystemExit("PANEL_URL должен быть https:// (http разрешён только для localhost)")
+    url, token = credentials(sys.argv, os.environ)
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     log.info("nodecheck-agent %s, панель %s", VERSION, url)
