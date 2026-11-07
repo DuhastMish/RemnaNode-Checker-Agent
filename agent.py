@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import probes
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 BATCH = 200
 
 log = logging.getLogger("agent")
@@ -166,7 +166,7 @@ class Agent:
             data = self.panel.call("GET", "/nodes")
             self.nodes, self.nodes_rev = data.get("nodes") or [], data.get("revision")
             active = sum(1 for n in self.nodes if n.get("is_active"))
-            log.info("список нод обновлён: %d, активных %d (ревизия %s)", len(self.nodes), active, self.nodes_rev)
+            log.info("список нод обновлён: %d, из них активных %d (ревизия %s)", len(self.nodes), active, self.nodes_rev)
 
     def heartbeat(self):
         r = self.panel.call("POST", "/heartbeat", {})
@@ -232,7 +232,8 @@ class Agent:
 
     def scheduled_check(self):
         try:
-            self.run_check([n for n in self.nodes if n.get("is_active")])
+            # проверяются все ноды, и неактивные тоже: панель покажет, можно ли вернуть их в дело
+            self.run_check(list(self.nodes))
         except Exception:
             log.exception("плановая проверка упала")
         finally:
