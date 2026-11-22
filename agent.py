@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import probes
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 BATCH = 200
 
 log = logging.getLogger("agent")
@@ -118,6 +118,21 @@ def check_target(t, cfg, job_id=None):
     }
 
 
+def check_sni(d, timeout):
+    """d: {sni_id, domain}. Возвращает результат для панели."""
+    ok, status, code, ms = probes.check_http(d["domain"], timeout)
+    return {
+        "result_uid": str(uuid.uuid4()),
+        "sni_id": d.get("sni_id"),
+        "domain": d["domain"],
+        "ts": int(time.time()),
+        "ok": ok,
+        "http_status": code,
+        "status": status,
+        "latency_ms": ms,
+    }
+
+
 # ---------- агент ----------
 
 
@@ -128,6 +143,9 @@ class Agent:
         self.config_rev = None
         self.nodes = []
         self.nodes_rev = None
+        self.sni = []  # SNI-домены хостов: [{sni_id, domain}], пусто — проверка выключена или панель старая
+        self.sni_rev = None
+        self.sni_timeout = 8
         self.heartbeat_sec = 30
         self.check_running = threading.Event()
         # ручные задания — отдельным пулом, не ждут окончания плановой проверки
@@ -168,6 +186,37 @@ class Agent:
             active = sum(1 for n in self.nodes if n.get("is_active"))
             log.info("список нод обновлён: %d, из них активных %d (ревизия %s)", len(self.nodes), active, self.nodes_rev)
 
+    def load_sni(self):
+        """SNI-домены хостов — отдельным запросом, существующий контракт с панелью не меняется.
+
+        404 — панель без проверки SNI; выключено в панели — пустой список; панель недоступна — по кэшу.
+        """
+        try:
+            data = self.panel.call("GET", "/sni")
+        except ApiError as e:
+            if e.status == 404:
+                self.sni, self.sni_rev = [], None
+                return
+            log.warning("список SNI-доменов не получен, проверяю по кэшу: %s", e)
+            return
+        except OSError as e:
+            log.warning("список SNI-доменов не получен, проверяю по кэшу: %s", e)
+            return
+        if not data.get("enabled"):
+            if self.sni:
+                log.info("проверка SNI-доменов выключена в панели")
+            self.sni, self.sni_rev = [], None
+            return
+        self.sni_timeout = int(data.get("timeout_sec") or 8)
+        if data.get("revision") == self.sni_rev:
+            return
+        domains = [d for d in data.get("domains") or [] if isinstance(d, dict)]
+        good = [d for d in domains if probes.valid_domain(d.get("domain"))]
+        if len(good) != len(domains):
+            log.warning("SNI: пропущено некорректных доменов: %d", len(domains) - len(good))
+        self.sni, self.sni_rev = good, data.get("revision")
+        log.info("список SNI-доменов обновлён: %d (ревизия %s)", len(self.sni), self.sni_rev)
+
     def heartbeat(self):
         r = self.panel.call("POST", "/heartbeat", {})
         self.refresh(r.get("config_revision"), r.get("nodes_revision"))
@@ -175,11 +224,11 @@ class Agent:
 
     # --- проверки ---
 
-    def send(self, results):
+    def send(self, results, path="/results"):
         sent = 0
         for i in range(0, len(results), BATCH):
             try:
-                self.panel.call("POST", "/results", {"results": results[i : i + BATCH]})
+                self.panel.call("POST", path, {"results": results[i : i + BATCH]})
                 sent += len(results[i : i + BATCH])
             except (ApiError, OSError) as e:
                 log.warning("результаты не отправлены (%d шт., без буферизации): %s", len(results) - sent, e)
@@ -201,6 +250,25 @@ class Agent:
             stats["green"],
             stats["yellow"],
             stats["red"],
+            sent,
+        )
+
+    def run_sni(self, domains):
+        if not domains:
+            return
+        workers = max(1, int(self.config.get("max_workers") or 15))
+        timeout = self.sni_timeout
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(lambda d: check_sni(d, timeout), domains))
+        ok = sum(1 for r in results if r["ok"])
+        sent = self.send(results, "/sni/results")
+        log.info(
+            "SNI: %d доменов за %.0f с — 200 у %d, нет у %d; отправлено %d",
+            len(results),
+            time.time() - t0,
+            ok,
+            len(results) - ok,
             sent,
         )
 
@@ -236,6 +304,11 @@ class Agent:
             self.run_check(list(self.nodes))
         except Exception:
             log.exception("плановая проверка упала")
+        try:
+            self.load_sni()
+            self.run_sni(list(self.sni))
+        except Exception:
+            log.exception("проверка SNI-доменов упала")
         finally:
             self.check_running.clear()
 
